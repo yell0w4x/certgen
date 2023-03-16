@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+if [ -z "$(command -v realpath)" ]; then
+    realpath() {
+        [[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}"
+    }
+fi
+
+THIS_DIR="$(dirname $(realpath ${0}))"
+
+usage() {
+cat << EOF
+Generates self-signed root CA certificate and certificate for the specified domain.
+
+Usage:
+    ${0} [OPTIONS] DOMAIN
+
+Arguments:
+    DOMAIN Domain name to generate certificate for. 
+           Override the CN parameter in --subj if specified.
+           Use *.example.com format for wildcard certificate.
+
+Options:
+    -a, --ip        Host ip address (default: 127.0.0.1)
+    -s, --subj      OpenSSL subj parameter in format "/C=US/ST=CA/O=MyOrg, Inc./CN=example.com"
+                    (default: "/C=US/ST=CA/O=MyOrg, Inc./CN=\${DOMAIN}")
+    -d, --out-dir   Output directory. If doesn't exist it's created (default: ${PWD})
+    --days          Number of days generated certificates are valid (default: 3650)
+    -h, --help      Show this message and exit
+EOF
+}
+
+ARGS=()
+SUBJ="/C=US/ST=CA/O=MyOrg, Inc./CN=example.com"
+OUT_DIR="${PWD}"
+DAYS=3650
+IP=127.0.0.1
+
+while [ ${#} -gt 0 ]; do 
+    case "${1}" in 
+        -h|--help)
+            usage
+            exit
+            ;;
+
+        -a|--ip)
+            shift
+            IP="${1}"
+            ;;
+
+        -s|--subj)
+            shift
+            SUBJ="${1}"
+            ;;
+
+        -d|--out-dir)
+            shift
+            OUT_DIR="$(realpath ${1})"
+            ;;
+
+        --days)
+            shift
+            DAYS="${1}"
+            ;;
+
+        *)
+            ARGS+=("${1}")
+            ;;
+    esac
+
+    shift
+done
+
+if [ -z "$(command -v openssl)" ]; then
+    echo -e "\033[33mopenssl binary is not found\033[0m"
+    exit 1
+fi
+
+if [ "${#ARGS[@]}" -eq 0 ]; then
+    echo -e "\033[33mDOMAIN is required\033[0m"
+    usage
+    exit 1
+fi
+
+if [ "${#ARGS[@]}" -gt 1 ]; then
+    echo -e "\033[33mUnrecognized extra agrs specified\033[0m"
+    usage
+    exit 1
+fi
+
+set -eu
+
+DOMAIN="${ARGS[0]}"
+SUBJ="$(echo "${SUBJ}" | sed -E s:CN=[a-zA-Z0-9._\-]*:CN=${DOMAIN}:g)"
+
+mkdir -p "${OUT_DIR}"
+
+ROOT_CA_EXT_FN=/tmp/root_ca.ext
+DOMAIN_EXT_FN=/tmp/site.ext
+
+root_ca() {
+cat << EOF > "${ROOT_CA_EXT_FN}"
+[root_ca]
+basicConstraints = critical,CA:TRUE,pathlen:1
+keyUsage = critical, nonRepudiation, cRLSign, keyCertSign
+subjectKeyIdentifier=hash    
+EOF
+}
+
+site() {
+cat << EOF > "${DOMAIN_EXT_FN}"
+[server]
+authorityKeyIdentifier=keyid,issuer
+basicConstraints = critical,CA:FALSE
+extendedKeyUsage=serverAuth
+keyUsage = critical, digitalSignature, keyEncipherment
+subjectAltName = DNS:${DOMAIN}, IP:${IP}
+subjectKeyIdentifier=hash
+EOF
+}
+
+root_ca
+site
+
+DOMAIN="$(echo "${DOMAIN}" | sed -E 's/^\*\.//g')"
+ROOT_CA_KEY_FN="${OUT_DIR}/root-ca-${DOMAIN}.key"
+ROOT_CA_CSR_FN="${OUT_DIR}/root-ca-${DOMAIN}.csr"
+ROOT_CA_CRT_FN="${OUT_DIR}/root-ca-${DOMAIN}.crt"
+DOMAIN_KEY_FN="${OUT_DIR}/${DOMAIN}.key"
+DOMAIN_CSR_FN="${OUT_DIR}/${DOMAIN}.csr"
+DOMAIN_CRT_FN="${OUT_DIR}/${DOMAIN}.crt"
+
+# root
+openssl genrsa -out "${ROOT_CA_KEY_FN}" 4096
+openssl req -new -key "${ROOT_CA_KEY_FN}" -out "${ROOT_CA_CSR_FN}" -sha256 \
+        -subj '/C=US/ST=CA/O=MyOrg, Inc./CN=My CA'
+openssl x509 -req -days "${DAYS}" -in "${ROOT_CA_CSR_FN}" \
+        -signkey "${ROOT_CA_KEY_FN}" -sha256 -out "${ROOT_CA_CRT_FN}" \
+        -extfile "${ROOT_CA_EXT_FN}" -extensions root_ca
+# domain
+openssl genrsa -out "${DOMAIN_KEY_FN}" 4096
+openssl req -new -sha256 -key "${DOMAIN_KEY_FN}" -subj "${SUBJ}" -out "${DOMAIN_CSR_FN}"
+openssl x509 -req -days "${DAYS}" -in "${DOMAIN_CSR_FN}" -sha256 \
+    -CA "${ROOT_CA_CRT_FN}" -CAkey "${ROOT_CA_KEY_FN}" -CAcreateserial \
+    -out "${DOMAIN_CRT_FN}" -extfile "${DOMAIN_EXT_FN}" -extensions server
